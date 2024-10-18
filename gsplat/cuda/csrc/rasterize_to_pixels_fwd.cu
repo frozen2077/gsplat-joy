@@ -5,9 +5,47 @@
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
 
+#include <cuda.h>
+#include <cooperative_groups/reduce.h>
+#include "structs.h"
+
+template <uint32_t CDIM>
+PerGaussian::ImageState<CDIM> PerGaussian::ImageState<CDIM>::fromChunk(char*& chunk, size_t N)
+{
+	ImageState<CDIM> img;
+	obtain(chunk, img.accum_alpha, N, 128);
+	obtain(chunk, img.n_contrib, N, 128);
+	obtain(chunk, img.ranges, N, 128);
+	int dummy = 0;
+	int wummy = 0;
+	cub::DeviceScan::InclusiveSum(nullptr, img.scan_size, &dummy, &wummy, N); // scan_size 1023
+	obtain(chunk, img.contrib_scan, img.scan_size, 128);
+
+	obtain(chunk, img.max_contrib, N, 128);
+	obtain(chunk, img.pixel_colors, N * CDIM, 128);
+	obtain(chunk, img.bucket_count, N, 128); //uint32_t img.scan_size 
+	obtain(chunk, img.bucket_offsets, N, 128);
+	cub::DeviceScan::InclusiveSum(nullptr, img.bucket_count_scan_size, img.bucket_count, img.bucket_count, N);
+	obtain(chunk, img.bucket_count_scanning_space, img.bucket_count_scan_size, 128);
+
+	return img;
+}
+
+template <uint32_t CDIM>
+PerGaussian::SampleState<CDIM> PerGaussian::SampleState<CDIM>::fromChunk(char *& chunk, size_t C) 
+{
+	SampleState<CDIM> sample;
+	obtain(chunk, sample.bucket_to_tile, C * 256, 128);
+	obtain(chunk, sample.T, C * 256, 128);
+	obtain(chunk, sample.ar, CDIM * C * 256, 128);
+	return sample;
+}
+
+
 namespace gsplat {
 
 namespace cg = cooperative_groups;
+namespace pg = PerGaussian;
 
 /****************************************************************************
  * Rasterization to Pixels Forward Pass
@@ -34,7 +72,9 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     S *__restrict__ render_colors, // [C, image_height, image_width, COLOR_DIM]
     S *__restrict__ render_alphas, // [C, image_height, image_width, 1]
-    int32_t *__restrict__ last_ids // [C, image_height, image_width]
+    int32_t *__restrict__ last_ids, // [C, image_height, image_width]
+    const uint32_t *__restrict__ per_tile_bucket_offset, uint32_t *__restrict__ bucket_to_tile,
+    float *__restrict__ sampled_T, float* __restrict__ sampled_ar, int32_t* max_contrib
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -88,6 +128,18 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     uint32_t num_batches =
         (range_end - range_start + block_size - 1) / block_size;
 
+    uint32_t real_tile_id = camera_id * tile_height * tile_width + tile_id;
+	// what is the number of buckets before me? what is my offset?
+	uint32_t bbm = real_tile_id == 0 ? 0 : per_tile_bucket_offset[real_tile_id - 1];
+	// let's first quickly also write the bucket-to-tile mapping
+	int num_buckets = (range_end - range_start + 31) / 32; // (500 + 31) / 32 = 16.5
+ 	for (int i = 0; i < (num_buckets + block_size - 1) / block_size; ++i) {
+		int bucket_idx = i * block_size + block.thread_rank();
+		if (bucket_idx < num_buckets) {
+			bucket_to_tile[bbm + bucket_idx] = real_tile_id;
+		}
+	}
+
     extern __shared__ int s[];
     int32_t *id_batch = (int32_t *)s; // [block_size]
     vec3<S> *xy_opacity_batch =
@@ -103,7 +155,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     S T = 1.0f;
     // index of most recent gaussian to write to this thread's pixel
     uint32_t cur_idx = 0;
-
+	int32_t last_contributor = 0;
     // collect and process batches of gaussians
     // each thread loads one gaussian at a time before rasterizing its
     // designated pixel
@@ -136,6 +188,18 @@ __global__ void rasterize_to_pixels_fwd_kernel(
         // process gaussians in the current batch for this pixel
         uint32_t batch_size = min(block_size, range_end - batch_start);
         for (uint32_t t = 0; (t < batch_size) && !done; ++t) {
+
+			// add incoming T value for every 32nd gaussian
+			if (t % 32 == 0) {
+				//uint32_t bbm = tile_id == 0 ? 0 : per_tile_bucket_offset[tile_id - 1];
+				sampled_T[(bbm * block_size) + block.thread_rank()] = T;
+				for (int ch = 0; ch < COLOR_DIM; ++ch) {
+					sampled_ar[(bbm * block_size * COLOR_DIM) + ch * block_size + block.thread_rank()] = pix_out[ch];
+				}
+				++bbm; //每32个高斯保存一个tile里的所有256个像素
+			}
+
+            cur_idx++;
             const vec3<S> conic = conic_batch[t];
             const vec3<S> xy_opac = xy_opacity_batch[t];
             const S opac = xy_opac.z;
@@ -161,8 +225,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
             for (uint32_t k = 0; k < COLOR_DIM; ++k) {
                 pix_out[k] += c_ptr[k] * vis;
             }
-            cur_idx = batch_start + t;
-
+            //cur_idx = batch_start + t;
+            last_contributor = cur_idx;
             T = next_T;
         }
     }
@@ -181,12 +245,30 @@ __global__ void rasterize_to_pixels_fwd_kernel(
                                        : (pix_out[k] + T * backgrounds[k]);
         }
         // index in bin of last gaussian in this pixel
-        last_ids[pix_id] = static_cast<int32_t>(cur_idx);
+        last_ids[pix_id] = last_contributor;
     }
+
+	// max reduce the last contributor
+    typedef cub::BlockReduce<uint32_t, 256> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+    last_contributor = BlockReduce(temp_storage).Reduce(last_contributor, cub::Max());
+	if (block.thread_rank() == 0) {
+		max_contrib[tile_id] = last_contributor;
+	}    
+}
+
+__global__ void perTileBucketCount(int T, int32_t* ranges, uint32_t* bucketCount, uint32_t n_isects) {
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= T)
+		return;
+
+	int num_splats = idx == (T - 1) ? n_isects - ranges[idx] : ranges[idx + 1] - ranges[idx];
+	int num_buckets = (num_splats + 31) / 32;
+	bucketCount[idx] = (uint32_t) num_buckets;
 }
 
 template <uint32_t CDIM>
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, unsigned int, torch::Tensor, torch::Tensor> call_kernel_with_dim(
     // Gaussian parameters
     const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]
     const torch::Tensor &conics,    // [C, N, 3] or [nnz, 3]
@@ -202,6 +284,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
     const torch::Tensor &flatten_ids   // [n_isects]
 ) {
+    bool debug = true;
+
     GSPLAT_DEVICE_GUARD(means2d);
     GSPLAT_CHECK_INPUT(means2d);
     GSPLAT_CHECK_INPUT(conics);
@@ -241,6 +325,37 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
         {C, image_height, image_width}, means2d.options().dtype(torch::kInt32)
     );
 
+    torch::Device device(torch::kCUDA);
+    torch::TensorOptions options(torch::kByte);
+    torch::Tensor imgBuffer    = torch::empty({0}, options.device(device));
+    torch::Tensor sampleBuffer = torch::empty({0}, options.device(device));
+
+	size_t img_chunk_size = pg::required<pg::ImageState<CDIM>>(image_width * image_height);
+	char* img_chunkptr    = reinterpret_cast<char*>(imgBuffer.resize_({(long long)img_chunk_size}).contiguous().data_ptr());
+    //CHECK_CUDA(cudaMemset(img_chunkptr, 0, img_chunk_size),debug);
+	pg::ImageState<CDIM> imgState = pg::ImageState<CDIM>::fromChunk(img_chunkptr, image_width * image_height);
+
+ 	// bucket count
+	int num_tiles = C * tile_height * tile_width; 
+	perTileBucketCount<<<(num_tiles + 255) / 256, 256>>>(
+        num_tiles, tile_offsets.data_ptr<int32_t>(), imgState.bucket_count, n_isects);
+    CHECK_CUDA(, debug);
+
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(
+		imgState.bucket_count_scanning_space, 
+		imgState.bucket_count_scan_size, 
+		imgState.bucket_count, imgState.bucket_offsets, // imgState.bucket_offsets = ADDSUM(imgState.bucket_count)
+		num_tiles), debug);
+        
+	unsigned int bucket_sum;
+	CHECK_CUDA(cudaMemcpy(&bucket_sum, imgState.bucket_offsets + num_tiles - 1, sizeof(unsigned int), cudaMemcpyDeviceToHost), debug);
+	// create a state to store. size is number is the total number of buckets * block_size
+	size_t sample_chunk_size = pg::required<pg::SampleState<CDIM>>(bucket_sum);
+	char* sample_chunkptr = reinterpret_cast<char*>(sampleBuffer.resize_({(long long)sample_chunk_size}).contiguous().data_ptr());
+    //CHECK_CUDA(cudaMemset(sample_chunkptr, 0, sample_chunk_size),debug);
+	pg::SampleState<CDIM> sampleState = pg::SampleState<CDIM>::fromChunk(sample_chunkptr, bucket_sum);
+
+
     at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
     const uint32_t shared_mem =
         tile_size * tile_size *
@@ -260,6 +375,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
             " bytes), try lowering tile_size."
         );
     }
+    CHECK_CUDA(, debug);
     rasterize_to_pixels_fwd_kernel<CDIM, float>
         <<<blocks, threads, shared_mem, stream>>>(
             C,
@@ -282,13 +398,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> call_kernel_with_dim(
             flatten_ids.data_ptr<int32_t>(),
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
-            last_ids.data_ptr<int32_t>()
+            last_ids.data_ptr<int32_t>(),
+            imgState.bucket_offsets, sampleState.bucket_to_tile, //per_tile_bucket_offset | bucket_to_tile
+		    sampleState.T, sampleState.ar, imgState.max_contrib
         );
 
-    return std::make_tuple(renders, alphas, last_ids);
+	CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, renders.data_ptr(), sizeof(float) * image_width * image_height * CDIM, cudaMemcpyDeviceToDevice), debug);
+    return std::make_tuple(renders, alphas, last_ids, bucket_sum, imgBuffer, sampleBuffer);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, unsigned int, torch::Tensor, torch::Tensor>
 rasterize_to_pixels_fwd_tensor(
     // Gaussian parameters
     const torch::Tensor &means2d,   // [C, N, 2] or [nnz, 2]

@@ -1,16 +1,9 @@
-# Needs g++ >= 11, which set C++17 as default standard.
-
-cmake_minimum_required(VERSION 3.12)
-project(gsplat LANGUAGES CXX CUDA)
-
-# Set version
-set(GSPLAT_VERSION "0.1")
+cmake_minimum_required(VERSION 3.20)
+project(DiffRast LANGUAGES CUDA CXX)
 
 # Ensure `-fPIC` is used
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-
-# Define CUDA flags
-set(NVCC_FLAGS "-O3 --use_fast_math")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g")
 
 # Get the Torch path from Python
 execute_process(
@@ -20,47 +13,61 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
-# Check if the command was successful
+message(STATUS "Python path is: ${_python_prefix_path}")
+
 if (_result EQUAL 0)
-    # Set the CMAKE_PREFIX_PATH
     set(CMAKE_PREFIX_PATH "${_python_prefix_path}" CACHE PATH "Path to Torch")
 else()
     message(FATAL_ERROR "Failed to get CMAKE_PREFIX_PATH from Python")
 endif()
 
-# Find packages
-find_package(PythonLibs REQUIRED)
-find_package(Torch REQUIRED)
+# set(Python_FIND_STRATEGY "LOCATION")
 
-# Include directories
-include_directories(${PYTHON_INCLUDE_DIRS})
+find_package(Python 3.10 COMPONENTS Interpreter Development REQUIRED)
+find_package(Torch REQUIRED)
+find_package(pybind11 CONFIG REQUIRED)
+
+find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib")
+
 include_directories(${CMAKE_SOURCE_DIR})
 include_directories(${CMAKE_SOURCE_DIR}/third_party/glm)
+include_directories(${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
-# Set up CUDA flags
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${NVCC_FLAGS}")
+message(STATUS "PYTHON_INCLUDE_DIRS:  ${PYTHON_INCLUDE_DIRS}")
+message(STATUS "TORCH_PYTHON_LIBRARY: ${TORCH_PYTHON_LIBRARY}")
+message(STATUS "TORCH_LIBRARIES:      ${TORCH_LIBRARIES}")
+message(STATUS "CMAKE_CUDA_FLAGS:     ${CMAKE_CUDA_FLAGS}")
 
-# Gather source files
-file(GLOB_RECURSE SOURCES
+file(GLOB SOURCES
     ${CMAKE_SOURCE_DIR}/*.cu
 )
+add_library(gsplat SHARED ${SOURCES})
 
-# Create the library
-add_library(gsplat STATIC ${SOURCES})
+message(STATUS "SOURCES: ${SOURCES}")
 
-# Link libraries
-target_link_libraries(gsplat ${TORCH_LIBRARIES} ${PYTHON_LIBRARIES})
+set_target_properties(gsplat PROPERTIES CUDA_ARCHITECTURES "86;89")
+target_include_directories(gsplat PRIVATE "/home/joey/anaconda3/envs/gsplat/include/python3.10")
+target_link_libraries(gsplat PRIVATE "${TORCH_LIBRARIES}" "${TORCH_PYTHON_LIBRARY}")
 
-# Set additional properties
-set_target_properties(gsplat PROPERTIES
-    VERSION ${GSPLAT_VERSION}
-    SOVERSION 1
+pybind11_add_module(csrc
+    ext.cpp 
 )
 
-# Install targets
-install(TARGETS gsplat
-    ARCHIVE DESTINATION lib
-    LIBRARY DESTINATION lib
+set_target_properties(csrc PROPERTIES CUDA_ARCHITECTURES "86;89")
+target_link_libraries(csrc PRIVATE gsplat "${TORCH_LIBRARIES}" "${TORCH_PYTHON_LIBRARY}")
+
+set(DESTINATION_FOLDER "/mnt/d/Desktop/gsplat-joy/gsplat")
+
+add_custom_command(
+    TARGET gsplat
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:gsplat> ${DESTINATION_FOLDER}
+    COMMENT "Copying gsplat to output folder"
 )
 
-message(STATUS "CMake configuration done!")
+add_custom_command(
+    TARGET csrc
+    POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:csrc> ${DESTINATION_FOLDER}
+    COMMENT "Copying csrc to output folder"
+)
