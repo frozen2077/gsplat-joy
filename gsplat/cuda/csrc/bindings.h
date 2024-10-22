@@ -155,10 +155,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> isect_tiles_tensor(
     const uint32_t tile_width,
     const uint32_t tile_height,
     const bool sort,
-    const bool double_buffer
+    const bool double_buffer,
+    const torch::Tensor &conics,                    // [C, N, 2] or [nnz, 2]
+    const torch::Tensor &opacities                    // [C, N] or [nnz]    
 );
 
-torch::Tensor isect_offset_encode_tensor(
+std::tuple<torch::Tensor, uint32_t> isect_offset_encode_tensor(
     const torch::Tensor &isect_ids, // [n_isects]
     const uint32_t C,
     const uint32_t tile_width,
@@ -180,7 +182,8 @@ rasterize_to_pixels_fwd_tensor(
     const uint32_t tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &flatten_ids   // [n_isects]
+    const torch::Tensor &flatten_ids,   // [n_isects]
+    const uint32_t valid_isects
 );
 
 std::tuple<
@@ -214,7 +217,8 @@ rasterize_to_pixels_bwd_tensor(
     bool absgrad,
 	const int B,
 	const torch::Tensor& imageBuffer,
-	const torch::Tensor& sampleBuffer    
+	const torch::Tensor& sampleBuffer,
+    const uint32_t valid_isects   
 );
 
 std::tuple<torch::Tensor, torch::Tensor> rasterize_to_indices_in_range_tensor(

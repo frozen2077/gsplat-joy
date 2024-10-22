@@ -53,7 +53,8 @@ __global__ void rasterize_to_pixels_bwd_kernel(
 	const uint32_t* __restrict__ per_tile_bucket_offset,
 	const uint32_t* __restrict__ bucket_to_tile,
 	const float* __restrict__ sampled_T, const float* __restrict__ sampled_ar, 
-    const int32_t* __restrict__ max_contrib, const float* __restrict__ pixel_colors
+    const int32_t* __restrict__ max_contrib, const float* __restrict__ pixel_colors,
+    const uint32_t valid_isects
 ) {
     auto block = cg::this_thread_block();
 	auto my_warp = cg::tiled_partition<32>(block);
@@ -71,7 +72,7 @@ __global__ void rasterize_to_pixels_bwd_kernel(
     uint32_t camera_id = tile_id / (tile_width * tile_height);
     int32_t range_end =
         (camera_id == C - 1) && (tile_id == tile_width * tile_height - 1)
-            ? n_isects
+            ? valid_isects
             : tile_offsets[tile_id + 1];
 	num_splats_in_tile = range_end - range_start;
 
@@ -259,7 +260,8 @@ call_kernel_with_dim(
     bool absgrad,
 	const int B,
 	const torch::Tensor& imageBuffer,
-	const torch::Tensor& sampleBuffer      
+	const torch::Tensor& sampleBuffer,
+    const uint32_t valid_isects      
 ) {
 
     GSPLAT_DEVICE_GUARD(means2d);
@@ -364,7 +366,8 @@ call_kernel_with_dim(
                 sampleState.T,
                 sampleState.ar,
                 imgState.max_contrib,
-                imgState.pixel_colors
+                imgState.pixel_colors,
+                valid_isects
             );
     }
 
@@ -404,7 +407,8 @@ rasterize_to_pixels_bwd_tensor(
     bool absgrad,
 	const int B,
 	const torch::Tensor& imageBuffer,
-	const torch::Tensor& sampleBuffer  
+	const torch::Tensor& sampleBuffer,
+    const uint32_t valid_isects
 ) {
 
     GSPLAT_CHECK_INPUT(colors);
@@ -431,7 +435,8 @@ rasterize_to_pixels_bwd_tensor(
             absgrad,                                                           \
             B,                                                                 \
             imageBuffer,                                                       \
-            sampleBuffer                                                       \
+            sampleBuffer,                                                       \
+            valid_isects \
         );
 
     switch (COLOR_DIM) {

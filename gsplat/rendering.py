@@ -501,13 +501,15 @@ def rasterization(
         tile_size,
         tile_width,
         tile_height,
+        conics,
+        opacities,
         packed=packed,
         n_cameras=C,
         camera_ids=camera_ids,
         gaussian_ids=gaussian_ids,
     )
     # print("rank", world_rank, "Before isect_offset_encode")
-    isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
+    isect_offsets, valid_isects = isect_offset_encode(isect_ids, C, tile_width, tile_height)
 
     meta.update(
         {
@@ -521,6 +523,7 @@ def rasterization(
             "height": height,
             "tile_size": tile_size,
             "n_cameras": C,
+            "valid_isects": valid_isects,
         }
     )
 
@@ -546,6 +549,7 @@ def rasterization(
                 tile_size,
                 isect_offsets,
                 flatten_ids,
+                valid_isects,
                 backgrounds=backgrounds_chunk,
                 packed=packed,
                 absgrad=absgrad,
@@ -565,6 +569,7 @@ def rasterization(
             tile_size,
             isect_offsets,
             flatten_ids,
+            valid_isects,
             backgrounds=backgrounds,
             packed=packed,
             absgrad=absgrad,

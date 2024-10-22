@@ -83,6 +83,7 @@ try:
     from gsplat import csrc as _C
 except ImportError:
     # if failed, try with JIT compilation
+    raise
     if cuda_toolkit_available():
         name = "gsplat_cuda"
         build_dir = _get_build_directory(name, verbose=False)

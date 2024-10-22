@@ -13,15 +13,15 @@ exec(open("gsplat/version.py", "r").read())
 URL = "https://github.com/nerfstudio-project/gsplat"
 
 BUILD_NO_CUDA = os.getenv("BUILD_NO_CUDA", "0") == "1"
-WITH_SYMBOLS = os.getenv("WITH_SYMBOLS", "0") == "1"
-LINE_INFO = os.getenv("LINE_INFO", "0") == "1"
+WITH_SYMBOLS = False
+LINE_INFO = False
 MAX_JOBS = os.getenv("MAX_JOBS")
 need_to_unset_max_jobs = False
 if not MAX_JOBS:
     need_to_unset_max_jobs = True
     os.environ["MAX_JOBS"] = "10"
     print(f"Setting MAX_JOBS to {os.environ['MAX_JOBS']}")
-
+os.environ['TORCH_CUDA_ARCH_LIST'] = '8.9'
 
 def get_ext():
     from torch.utils.cpp_extension import BuildExtension
@@ -72,7 +72,7 @@ def get_extensions():
 
     nvcc_flags = os.getenv("NVCC_FLAGS", "")
     nvcc_flags = [] if nvcc_flags == "" else nvcc_flags.split(" ")
-    nvcc_flags += ["-O3", "--use_fast_math"]
+    nvcc_flags += ["-O3", "-use_fast_math"]
     if LINE_INFO:
         nvcc_flags += ["-lineinfo"]
     if torch.version.hip:
@@ -140,6 +140,10 @@ setup(
     # https://github.com/pypa/setuptools/issues/1461#issuecomment-954725244
     include_package_data=True,
 )
+import shutil
+shutil.copy('/mnt/d/Desktop/gsplat-joy/build/lib.linux-x86_64-cpython-310/gsplat/csrc.so', 
+            '/mnt/d/Desktop/gsplat-joy/gsplat/csrc.so')
+
 
 if need_to_unset_max_jobs:
     print("Unsetting MAX_JOBS")

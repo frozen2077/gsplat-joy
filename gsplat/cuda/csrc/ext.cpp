@@ -1,6 +1,6 @@
 #include "bindings.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+PYBIND11_MODULE(csrc, m) {
     py::enum_<gsplat::CameraModelType>(m, "CameraModelType")
         .value("PINHOLE", gsplat::CameraModelType::PINHOLE)
         .value("ORTHO", gsplat::CameraModelType::ORTHO)

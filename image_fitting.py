@@ -163,7 +163,7 @@ def main(
     num_points: int = 100000,
     save_imgs: bool = True,
     img_path: Optional[Path] = None,
-    iterations: int = 200,
+    iterations: int = 300,
     lr: float = 0.01,
     model_type: Literal["3dgs", "2dgs"] = "3dgs",
 ) -> None:
@@ -185,5 +185,6 @@ def main(
 
 
 if __name__ == "__main__":
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     print(os.getpid())
     tyro.cli(main)

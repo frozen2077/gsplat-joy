@@ -1,4 +1,4 @@
-#include "bindings.h"
+`#include "bindings.h"
 #include "helpers.cuh"
 #include "types.cuh"
 #include <cooperative_groups.h>
@@ -74,7 +74,8 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     S *__restrict__ render_alphas, // [C, image_height, image_width, 1]
     int32_t *__restrict__ last_ids, // [C, image_height, image_width]
     const uint32_t *__restrict__ per_tile_bucket_offset, uint32_t *__restrict__ bucket_to_tile,
-    float *__restrict__ sampled_T, float* __restrict__ sampled_ar, int32_t* max_contrib
+    float *__restrict__ sampled_T, float* __restrict__ sampled_ar, int32_t* max_contrib,
+    const uint32_t valid_isects
 ) {
     // each thread draws one pixel, but also timeshares caching gaussians in a
     // shared tile
@@ -122,7 +123,7 @@ __global__ void rasterize_to_pixels_fwd_kernel(
     int32_t range_start = tile_offsets[tile_id];
     int32_t range_end =
         (camera_id == C - 1) && (tile_id == tile_width * tile_height - 1)
-            ? n_isects
+            ? valid_isects
             : tile_offsets[tile_id + 1];
     const uint32_t block_size = block.size();
     uint32_t num_batches =
@@ -257,12 +258,12 @@ __global__ void rasterize_to_pixels_fwd_kernel(
 	}    
 }
 
-__global__ void perTileBucketCount(int T, int32_t* ranges, uint32_t* bucketCount, uint32_t n_isects) {
+__global__ void perTileBucketCount(int T, int32_t* ranges, uint32_t* bucketCount, uint32_t valid_isects) {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= T)
 		return;
 
-	int num_splats = idx == (T - 1) ? n_isects - ranges[idx] : ranges[idx + 1] - ranges[idx];
+	int num_splats = idx == (T - 1) ? valid_isects - ranges[idx] : ranges[idx + 1] - ranges[idx];
 	int num_buckets = (num_splats + 31) / 32;
 	bucketCount[idx] = (uint32_t) num_buckets;
 }
@@ -282,7 +283,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, unsigned int, torch::Ten
     const uint32_t tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &flatten_ids   // [n_isects]
+    const torch::Tensor &flatten_ids,   // [n_isects]
+    const uint32_t valid_isects
 ) {
     bool debug = true;
 
@@ -338,7 +340,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, unsigned int, torch::Ten
  	// bucket count
 	int num_tiles = C * tile_height * tile_width; 
 	perTileBucketCount<<<(num_tiles + 255) / 256, 256>>>(
-        num_tiles, tile_offsets.data_ptr<int32_t>(), imgState.bucket_count, n_isects);
+        num_tiles, tile_offsets.data_ptr<int32_t>(), imgState.bucket_count, valid_isects);
     CHECK_CUDA(, debug);
 
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(
@@ -400,7 +402,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, unsigned int, torch::Ten
             alphas.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
             imgState.bucket_offsets, sampleState.bucket_to_tile, //per_tile_bucket_offset | bucket_to_tile
-		    sampleState.T, sampleState.ar, imgState.max_contrib
+		    sampleState.T, sampleState.ar, imgState.max_contrib, valid_isects
         );
 
 	CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, renders.data_ptr(), sizeof(float) * image_width * image_height * CDIM, cudaMemcpyDeviceToDevice), debug);
@@ -422,7 +424,8 @@ rasterize_to_pixels_fwd_tensor(
     const uint32_t tile_size,
     // intersections
     const torch::Tensor &tile_offsets, // [C, tile_height, tile_width]
-    const torch::Tensor &flatten_ids   // [n_isects]
+    const torch::Tensor &flatten_ids,   // [n_isects]
+    const uint32_t valid_isects
 ) {
     GSPLAT_CHECK_INPUT(colors);
     uint32_t channels = colors.size(-1);
@@ -440,7 +443,8 @@ rasterize_to_pixels_fwd_tensor(
             image_height,                                                      \
             tile_size,                                                         \
             tile_offsets,                                                      \
-            flatten_ids                                                        \
+            flatten_ids,                                                       \
+            valid_isects \
         );
 
     // TODO: an optimization can be done by passing the actual number of

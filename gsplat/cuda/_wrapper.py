@@ -12,7 +12,6 @@ def _make_lazy_cuda_func(name: str) -> Callable:
         from ._backend import _C
 
         return getattr(_C, name)(*args, **kwargs)
-
     return call_cuda
 
 
@@ -347,6 +346,8 @@ def isect_tiles(
     tile_size: int,
     tile_width: int,
     tile_height: int,
+    conics: Tensor,
+    opacities: Tensor,
     sort: bool = True,
     packed: bool = False,
     n_cameras: Optional[int] = None,
@@ -409,6 +410,8 @@ def isect_tiles(
         tile_height,
         sort,
         True,  # DoubleBuffer: memory efficient radixsort
+        conics,
+        opacities,
     )
     return tiles_per_gauss, isect_ids, flatten_ids
 
@@ -443,6 +446,7 @@ def rasterize_to_pixels(
     tile_size: int,
     isect_offsets: Tensor,  # [C, tile_height, tile_width]
     flatten_ids: Tensor,  # [n_isects]
+    valid_isects: int,
     backgrounds: Optional[Tensor] = None,  # [C, channels]
     masks: Optional[Tensor] = None,  # [C, tile_height, tile_width]
     packed: bool = False,
@@ -561,6 +565,7 @@ def rasterize_to_pixels(
         isect_offsets.contiguous(),
         flatten_ids.contiguous(),
         absgrad,
+        valid_isects
     )
 
     if padded_channels > 0:
@@ -916,6 +921,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         isect_offsets: Tensor,  # [C, tile_height, tile_width]
         flatten_ids: Tensor,  # [n_isects]
         absgrad: bool,
+        valid_isects: int
     ) -> Tuple[Tensor, Tensor]:
         render_colors, render_alphas, last_ids, num_buckets, imgState, sampleState = _make_lazy_cuda_func(
             "rasterize_to_pixels_fwd"
@@ -931,6 +937,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             tile_size,
             isect_offsets,
             flatten_ids,
+            valid_isects
         )
 
         ctx.save_for_backward(
@@ -952,6 +959,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         ctx.tile_size = tile_size
         ctx.absgrad = absgrad
         ctx.num_buckets = num_buckets
+        ctx.valid_isects = valid_isects
 
         # double to float
         render_alphas = render_alphas.float()
@@ -982,7 +990,7 @@ class _RasterizeToPixels(torch.autograd.Function):
         tile_size = ctx.tile_size
         absgrad = ctx.absgrad
         num_buckets = ctx.num_buckets
-
+        valid_isects = ctx.valid_isects
         (
             v_means2d_abs,
             v_means2d,
@@ -1008,7 +1016,8 @@ class _RasterizeToPixels(torch.autograd.Function):
             absgrad,
             num_buckets,
             imgState,
-            sampleState,            
+            sampleState,   
+            valid_isects         
         )
 
         if absgrad:
@@ -1034,6 +1043,7 @@ class _RasterizeToPixels(torch.autograd.Function):
             None,
             None,
             None,
+            None
         )
 
 

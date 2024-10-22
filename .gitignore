@@ -1,9 +1,10 @@
 .clangd
 compile_commands.json
-
+output/
+results/
 # Visual Studio Code configs.
 .vscode/
-
+.idea/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
